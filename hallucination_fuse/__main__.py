@@ -17,7 +17,7 @@ from .trust import CONTEXTS, assess
 
 con = Console()
 COLOR = {APPROVE: "green", REWRITE: "yellow", PULL_SOURCE: "cyan", ESCALATE: "magenta", BLOCK: "red"}
-CLS_COLOR = {"supported": "green", "partial": "yellow", "unverified": "cyan", "contradicted": "red"}
+CLS_COLOR = {"supported": "green", "partial": "yellow", "unverified": "cyan", "contradicted": "red", "contradicted_detail": "red"}
 
 
 def bar(v):
@@ -32,12 +32,15 @@ def show_report(report, ta, ctx):
         title="Decision at stake"))
 
     t = Table(title="Claim evidence (verdict × source quality)", show_lines=False)
-    for c in ("#", "Claim", "Ezio verdict", "Agent reads it as", "Sources", "Strength"):
+    for c in ("#", "Claim", "Ezio verdict", "Agent reads it as", "Matched source", "Listed", "Strength"):
         t.add_column(c)
     for a in ta.claims:
-        srcs = ", ".join("%s%s" % (s.type, " " + s.date if s.date else "") for s in a.claim.sources) or "—"
-        t.add_row(str(a.claim.id), a.claim.text[:70] + ("…" if len(a.claim.text) > 70 else ""), a.claim.verdict,
-                  "[%s]%s[/]" % (CLS_COLOR[a.cls], a.cls.upper() + (" ★" if a.load_bearing else "")), srcs[:40], "%.2f" % a.strength)
+        from collections import Counter
+        cnt = Counter(s.type for s in a.claim.sources)
+        listed = " ".join("%d %s" % (n, k) for k, n in cnt.items()) or "—"
+        t.add_row(str(a.claim.id), a.claim.text[:60] + ("…" if len(a.claim.text) > 60 else ""), a.claim.verdict + (": " + a.claim.verdict_detail if a.claim.verdict_detail else ""),
+                  "[%s]%s[/]" % (CLS_COLOR[a.cls], a.cls.upper().replace("_", " ") + (" (opinion)" if a.opinion else "") + (" ★" if a.load_bearing else "")),
+                  a.matched_type or "—", listed, "%.2f" % a.strength)
     con.print(t)
     con.print("[dim]★ = load-bearing (numbers / forecasts / absolutes). UNVERIFIED = unknown, not false.[/dim]")
 
