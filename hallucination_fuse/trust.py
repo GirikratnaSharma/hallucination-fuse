@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 from .parser import Claim, TrustReport
 
-SOURCE_QUALITY = {"Official": 1.0, "Academic": 0.9, "Reference": 0.6, "News": 0.6, "Other": 0.3}
+SOURCE_QUALITY = {"Official": 1.0, "Academic": 0.9, "News": 0.6, "Reference": 0.6, "Other": 0.3}
 
 SUPPORTED = {"Supported", "Mostly supported"}
 PARTIAL = {"Partially supported"}
@@ -37,8 +37,25 @@ CONTRADICTED = {"Disputed", "Contradicted", "Refuted", "Misleading", "False"}
 HIGHER_IS_BETTER = {"Accuracy": True, "Bias": True, "Tone": True, "Agreement": True}
 
 
-def verdict_class(v: str) -> str:
-    v = next((known for known in SUPPORTED | PARTIAL | CONTRADICTED if known.casefold() == v.strip().casefold()), v)
+OPINION = re.compile(r"\b(can|could|should|best|worst|removes?|ambiguity|fragment|outperforms?|clear winner|simple|serious|decisive|matters?|do not run|run on)\b", re.I)
+
+
+def is_opinion(text: str) -> bool:
+    """Normative / evaluative statements Ezio can't verify because they aren't facts."""
+    return not re.search(r"\d", text) and bool(OPINION.search(text))
+
+
+def matched_source(claim: Claim):
+    """The source Ezio actually matched (or contradicted) the claim against — not just listed."""
+    for k in claim.checks:
+        if k.source_idx and k.status in ("match", "contradicts", "different"):
+            return claim.source(k.source_idx), k
+    return None, None
+
+
+def verdict_class(v: str, detail: str = None) -> str:
+    if v.startswith("Contradicted") and detail and "detail" in detail.lower():
+        return "contradicted_detail"
     if v in SUPPORTED:
         return "supported"
     if v in PARTIAL:
@@ -50,8 +67,10 @@ def verdict_class(v: str) -> str:
 
 def claim_class(claim: Claim) -> str:
     """Sub-checks may reduce support, but cannot silently upgrade a verdict."""
-    cls = verdict_class(claim.verdict)
+    cls = verdict_class(claim.verdict, claim.verdict_detail)
     statuses = {c.status for c in claim.checks}
+    if cls == "contradicted_detail":
+        return cls
     if cls == "contradicted" or "contradicts" in statuses:
         return "contradicted"
     if any(c.source_idx is not None and claim.source(c.source_idx) is None for c in claim.checks):
@@ -71,28 +90,24 @@ def _year(d: Optional[str]) -> Optional[int]:
 
 
 def source_strength(claim: Claim, today: Optional[date] = None) -> float:
-    """0..1: how well the cited sources could back this claim (source type x recency; source count earns no bonus)."""
+    """Quality of linked evidence; merely listed sources cannot inflate support."""
     today = today or date.today()
-    if not claim.sources:
-        return 0.0
-    vals = []
-    seen = set()
-    for s in claim.sources:
-        key = " ".join(s.title.casefold().split())
+    linked = [claim.source(k.source_idx) for k in claim.checks
+              if k.status in ("match", "contradicts", "different") and k.source_idx]
+    candidates = [x for x in linked if x is not None] if claim.checks else claim.sources
+    vals, seen = [], set()
+    for source in candidates:
+        key = " ".join(source.title.casefold().split())
         if not key or key in seen:
             continue
         seen.add(key)
-        q = SOURCE_QUALITY.get(s.type, 0.3)
-        y = _year(s.date)
-        if y is not None:
-            age = today.year - y
-            if age > 5:
-                q *= 0.7
-            elif age > 2:
-                q *= 0.9
+        q = SOURCE_QUALITY.get(source.type, 0.0)
+        year = _year(source.date)
+        if year is not None:
+            age = today.year - year
+            q *= .7 if age > 5 else .9 if age > 2 else 1
         vals.append(q)
-    # Source independence is unknown, so count cannot increase the score.
-    return max(vals, default=0.0)
+    return min(vals, default=0.0) if claim.checks else max(vals, default=0.0)
 
 
 @dataclass
@@ -102,6 +117,9 @@ class ClaimAssessment:
     strength: float
     load_bearing: bool
     note: str
+    opinion: bool = False
+    matched_type: Optional[str] = None
+    partial_aspects: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -144,18 +162,36 @@ def assess(report: TrustReport, today: Optional[date] = None) -> TrustAssessment
     for c in report.claims:
         cls = claim_class(c)
         st = source_strength(c, today)
-        load = bool(re.search(r"\d|%|percent|most|majority|will|always|never", c.text, re.I))
-        if cls == "supported" and st < 0.5:
-            note = "marked Supported but only weak sources (%.2f) back it" % st
-        elif cls == "supported":
-            note = "supported by %d source(s), strength %.2f" % (len(c.sources), st)
+        load = bool(re.search(r"\d|%|percent|most|majority|every|always|never|millions", c.text, re.I))
+        ms, chk = matched_source(c)
+        mtype = ms.type if ms else None
+        mdesc = ("Source %d %s '%s'" % (ms.idx, ms.type, ms.title[:50])) if ms else "no matching source"
+        partial = [k.aspect for k in c.checks if k.status == "match"]
+        op = is_opinion(c.text)
+        if cls == "supported":
+            note = "matched by %s" % mdesc
+            if mtype and mtype not in ("Official", "Academic"):
+                offs = [s for s in c.sources if s.type == "Official"]
+                if offs:
+                    note += " — Official source listed but NOT the one that matched"
+        elif cls == "contradicted_detail":
+            note = "a detail is contradicted by %s" % mdesc
+        elif cls == "contradicted":
+            note = "contradicted by %s" % mdesc
         elif cls == "partial":
             note = "only partially supported"
-        elif cls == "contradicted":
-            note = "evidence contradicts this claim"
         else:
-            note = "could not be verified; %d source(s) found" % len(c.sources)
-        cas.append(ClaimAssessment(c, cls, st, load, note))
+            if partial and any(k.status == "not_found" for k in c.checks):
+                note = "only the %s matched (%s); the rest was not found" % ("/".join(partial), mdesc)
+            elif chk and chk.status == "match":
+                note = "matched only %s — too weak to verify" % mdesc
+            elif chk and chk.status == "different":
+                note = "%s gives a different detail" % mdesc
+            else:
+                note = "not found in %d source(s) checked" % len(c.sources)
+            if op:
+                note += "; may be evaluative; requires human review"
+        cas.append(ClaimAssessment(c, cls, st, load, note, op, mtype, partial))
 
     def claim_score(optimistic: bool) -> float:
         if not cas:
@@ -169,6 +205,8 @@ def assess(report: TrustReport, today: Optional[date] = None) -> TrustAssessment
                 v = 0.5
             elif a.cls == "contradicted":
                 v = 0.0
+            elif a.cls == "contradicted_detail":
+                v = 0.25
             else:
                 v = 0.85 if optimistic else 0.15
             tot += v * weight
@@ -186,8 +224,10 @@ def assess(report: TrustReport, today: Optional[date] = None) -> TrustAssessment
 
     # ---- findings ----
     crit = [f for f in report.findings if f.severity == "CRITICAL"]
-    notes = [f for f in report.findings if f.severity in ("NOTE", "WARNING")]
-    findings_score = max(0.0, 1.0 - 0.3 * len(crit) - sum(.15 if f.severity == "WARNING" else .05 for f in notes))
+    benign = re.compile(r"no significant|neutral and objective|reads as independent", re.I)
+    notes = [f for f in report.findings if f.severity in ("NOTE", "WARNING") and not benign.search(f.text)]
+    warn = [f for f in notes if f.severity == "WARNING"]
+    findings_score = max(0.0, 1.0 - 0.3 * len(crit) - 0.15 * len(warn) - 0.05 * (len(notes) - len(warn)))
 
     # ---- coverage: which fact-like sentences in the answer were never checked ----
     sents = [s for s in _sentences(report.analyzed_text) if _FACTY.search(s)]
@@ -206,12 +246,19 @@ def assess(report: TrustReport, today: Optional[date] = None) -> TrustAssessment
     if unchecked:
         blind.append("%d fact-like sentence(s) in the answer were never checked as claims" % len(unchecked))
     weak = [a for a in cas if a.cls == "supported" and a.strength < 0.5]
+    newsy = [a for a in cas if a.cls == "supported" and a.matched_type not in (None, "Official", "Academic")]
+    if newsy:
+        blind.append("Supported claim(s) %s matched a %s source, not an Official one" % (", ".join("#%d" % a.claim.id for a in newsy), "/".join(sorted({a.matched_type for a in newsy}))))
     if weak:
         blind.append("%d 'Supported' claim(s) rest only on low-quality (Other/News) or stale sources" % len(weak))
     if any(c.pending_sources for c in report.claims):
-        blind.append("Human-submitted sources remain pending verification and do not raise trust")
-    if any(v is None for v in report.scores.values()):
-        blind.append("some module scores were missing from the report")
+        blind.append("Submitted sources remain pending verification and do not raise trust")
+    for m, v in report.scores.items():
+        if v is None:
+            blind.append("Ezio could not score %s (%s)" % (m, report.score_notes.get(m, "missing")))
+    ops = [a for a in cas if a.cls == "unverified" and a.opinion]
+    if ops:
+        blind.append("%d 'unverified' claim(s) may be evaluative; opinion detection is heuristic" % len(ops))
 
     return TrustAssessment(
         trust_low=round(lo, 3),

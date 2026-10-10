@@ -19,8 +19,8 @@ The offline demo runs both real PDFs through a guarded mock publication. It
 writes detailed JSON to `output/demo/` and audit records to `audit/`. No external
 publication occurs. Current public-comms decisions:
 
-- Nuclear: `BLOCK`, with an adverse claim verdict and contradictory sub-check.
-- Work from home: `PULL_SOURCE`, with unresolved claims and unscored Accuracy.
+- Nuclear: `REWRITE`, correcting an explicitly detail-only contradiction and qualifying unsupported parts.
+- Work from home: `ESCALATE`, with unresolved claims and unscored Accuracy.
 
 Both decisions stop execution. Outcomes follow evidence and context, not filenames.
 

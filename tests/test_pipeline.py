@@ -53,7 +53,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(decide(r, 'internal_memo').action, 'PULL_SOURCE')
 
     def test_real_pdf_decisions(self):
-        expected = {'nuclear': ('BLOCK', 1), 'wfh': ('PULL_SOURCE', 0)}
+        expected = {'nuclear': ('REWRITE', 0), 'wfh': ('ESCALATE', 0)}
         for name, (action, adverse) in expected.items():
             r = parse_report(str(ROOT / 'reports' / (name + '.pdf')))
             self.assertEqual((len(r.claims), len(r.findings)), (5, 4))
@@ -94,7 +94,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(r.claims[0].pending_sources), 1)
 
     def test_review_does_not_mutate_original_or_release_rewrite(self):
-        r = parse_report(str(ROOT / 'reports/nuclear.pdf'))
+        r = parse_report(str(ROOT / 'tests/fixtures/synthetic_wfh.txt'))
         d = decide(r, 'comms_publish')
         new, _, _ = human.apply_response(r, d, 'rewrite')
         self.assertEqual(d.action, 'BLOCK')
@@ -152,7 +152,7 @@ class PipelineTests(unittest.TestCase):
             with patch('hallucination_fuse.audit.record', return_value='0' * 64) as record:
                 with patch('hallucination_fuse.audit.verify', return_value=(True, 3, None)):
                     with redirect_stdout(io.StringIO()):
-                        main([str(ROOT / 'reports/nuclear.pdf'), '--no-network', '--human', 'rewrite'])
+                        main([str(ROOT / 'tests/fixtures/synthetic_wfh.txt'), '--no-network', '--human', 'rewrite'])
                 rewrite.assert_called_once()
                 self.assertIn('rewrite', [c.args[0] for c in record.call_args_list])
 

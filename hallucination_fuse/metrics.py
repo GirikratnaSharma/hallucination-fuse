@@ -65,7 +65,7 @@ def evaluate(report: TrustReport, weights: Mapping[int, float] | None = None) ->
     rate("supported_share", {"supported"}, "Weighted share supported after conservative sub-check reconciliation; no independent verification.")
     rate("partial_share", {"partial"}, "Weighted share with only partial support.")
     rate("uncertainty_share", {"unverified"}, "Weighted share without a conclusive verdict, including unrecognized verdicts.")
-    rate("contradiction_share", {"contradicted"}, "Weighted share carrying an adverse verdict; never averaged away by the support score.")
+    rate("contradiction_share", {"contradicted", "contradicted_detail"}, "Weighted share carrying an adverse verdict; never averaged away by the support score.")
 
     # A provenance proxy only: repeated citations do not increase this score.
     quality = {"official": 1.0, "academic": 0.9, "reference": 0.6, "news": 0.6, "other": 0.3}
@@ -102,7 +102,7 @@ def evaluate(report: TrustReport, weights: Mapping[int, float] | None = None) ->
         "Presence checks for analyzed text, nonempty claims, verdict, four module entries (including explicit Not scored), and parsed findings; not parser correctness.")
 
     coverage = metrics["exact_sentence_coverage"].value
-    support_value = {"supported": 1.0, "partial": 0.5, "unverified": 0.0, "contradicted": 0.0}
+    support_value = {"supported": 1.0, "partial": 0.5, "unverified": 0.0, "contradicted": 0.0, "contradicted_detail": 0.0}
     evidence = sum(w[i] * q[i] * support_value[classes[i]] for i in ids) / total if total else None
     metrics["evidence_readiness"] = Metric(
         evidence * coverage if evidence is not None and coverage is not None and not validation_errors(report) else None,
@@ -111,7 +111,7 @@ def evaluate(report: TrustReport, weights: Mapping[int, float] | None = None) ->
     holds = []
     if validation_errors(report):
         holds.append("Incomplete input: do not authorize execution from these metrics.")
-    if any(classes[i] == "contradicted" for i in ids):
+    if any(classes[i] in ("contradicted", "contradicted_detail") for i in ids):
         holds.append("Adverse claim verdict requires explicit review regardless of the aggregate score.")
     if any(classes[i] == "unverified" for i in ids):
         holds.append("Unresolved claims require evidence or a documented action-specific decision.")

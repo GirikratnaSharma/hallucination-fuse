@@ -44,6 +44,7 @@ class Decision:
     blind_spots: List[str]
     handoff: Optional[str] = None  # question for the accountable human
     targets: dict = field(default_factory=dict)  # claim ids per bucket
+
     reliability: dict = field(default_factory=dict)
     report_sha256: Optional[str] = None
 
@@ -82,83 +83,99 @@ def decide(report: TrustReport, context: str | Context, ta: Optional[TrustAssess
     reliability = evaluate(report).to_dict()
 
     contradicted = [a for a in ta.claims if a.cls == "contradicted"]
+    detail_wrong = [a for a in ta.claims if a.cls == "contradicted_detail"]
     unverified = [a for a in ta.claims if a.cls == "unverified"]
+    unv_opinion = [a for a in unverified if a.opinion]
+    unv_partial = [a for a in unverified if not a.opinion and a.partial_aspects and any(k.status == "not_found" for k in a.claim.checks)]
+    unv_fact = [a for a in unverified if a not in unv_opinion and a not in unv_partial]
     partial = [a for a in ta.claims if a.cls == "partial"]
     weak_supported = [a for a in ta.claims if a.cls == "supported" and a.strength < 0.5]
     strong_supported = [a for a in ta.claims if a.cls == "supported" and a.strength >= 0.5]
+    tag = lambda a: '"%s"' % _short(a.claim.text, 70)
 
-    # 1. Contradicted claims: negative evidence. Load-bearing + high blast -> BLOCK.
+    # 1. Contradicted claims = negative evidence (never confused with "unverified").
     for a in contradicted:
         push = BLOCK if (a.load_bearing and blast >= 0.6) else REWRITE
-        reasons.append(Reason("Claim %d" % a.claim.id, '"%s" — %s (%s)' % (_short(a.claim.text), a.claim.verdict, a.note), push))
+        reasons.append(Reason("Claim %d" % a.claim.id, "%s — Contradicted: %s" % (tag(a), a.note), push))
+        action = _max(action, push)
+    for a in detail_wrong:
+        strong = a.matched_type in ("Official", "Academic")
+        push = REWRITE
+        reasons.append(Reason("Claim %d" % a.claim.id, "%s — Contradicted (detail only): %s. Fixable by correcting the detail%s" % (
+            tag(a), a.note, "" if strong else "; the contradicting source is '%s' quality, so correct + flag rather than block" % a.matched_type), push))
         action = _max(action, push)
 
-    # 2. Critical findings.
-    for f in ta.critical_findings:
-        k = f.kind.lower()
-        if k in ("factual",):
-            push = BLOCK if blast >= 0.6 else ESCALATE
-        elif k in ("framing", "bias", "sycophancy", "tone", "sentiment"):
-            push = REWRITE  # fixable by rewriting, facts may still stand
-        else:
-            push = ESCALATE
-        reasons.append(Reason("Finding: %s (CRITICAL)" % f.kind, _short(f.text, 160), push))
+    # 2. Unverified ≠ false. Three different kinds, three different actions.
+    for a in unv_fact:
+        push = PULL_SOURCE if (a.load_bearing or blast >= 0.5) else REWRITE
+        reasons.append(Reason("Claim %d" % a.claim.id, "%s — Not enough evidence (%s). Unknown, not false → get evidence" % (tag(a), a.note), push))
         action = _max(action, push)
-
-    # 3. Unverified claims: uncertainty, not falsehood -> get more evidence first.
-    for a in unverified:
-        push = PULL_SOURCE if a.load_bearing or blast >= 0.5 else REWRITE
-        reasons.append(Reason("Claim %d" % a.claim.id, '"%s" — %s; treat as UNKNOWN, not false' % (_short(a.claim.text), a.claim.verdict), push))
-        action = _max(action, push)
-
+    for a in unv_partial:
+        reasons.append(Reason("Claim %d" % a.claim.id, "%s — %s → keep the verified part, cut the rest" % (tag(a), a.note), REWRITE))
+        action = _max(action, REWRITE)
+    for a in unv_opinion:
+        reasons.append(Reason("Claim %d" % a.claim.id, "%s — %s → attribute as opinion, don't state as fact" % (tag(a), a.note), REWRITE))
+        action = _max(action, REWRITE)
     for a in partial:
-        reasons.append(Reason("Claim %d" % a.claim.id, '"%s" — partially supported; needs hedging' % _short(a.claim.text), REWRITE))
+        reasons.append(Reason("Claim %d" % a.claim.id, "%s — partially supported; needs hedging" % tag(a), REWRITE))
         action = _max(action, REWRITE)
 
-    # 4. Source quality: "Supported" on weak sources is not the same as supported.
+    # 3. Supported claims: check WHICH source matched, not just the label.
     for a in weak_supported:
         push = PULL_SOURCE if blast >= 0.6 or a.strength == 0 else APPROVE
-        types = ", ".join(sorted({s.type for s in a.claim.sources})) or "no sources"
-        reasons.append(Reason("Claim %d sources" % a.claim.id, "Supported, but only by %s (strength %.2f)" % (types, a.strength), push))
+        reasons.append(Reason("Claim %d" % a.claim.id, "Supported, but %s (strength %.2f)" % (a.note, a.strength), push))
         action = _max(action, push)
-
     for a in strong_supported:
         reasons.append(Reason("Claim %d" % a.claim.id, "Supported — %s" % a.note, APPROVE))
 
     for a in ta.claims:
         for check in a.claim.checks:
             ref = "Claim %d / %s / Source %s" % (a.claim.id, check.aspect, check.source_idx or "unlinked")
-            push = BLOCK if check.status == "contradicts" and blast >= .6 else (
+            push = BLOCK if check.status == "contradicts" and a.cls != "contradicted_detail" and blast >= .6 else (
                 REWRITE if check.status in ("different", "contradicts") else
-                APPROVE if check.status == "match" else PULL_SOURCE)
+                APPROVE if check.status == "match" else REWRITE if a in unv_partial or a in unv_opinion else PULL_SOURCE)
             if check.source_idx is not None and a.claim.source(check.source_idx) is None:
                 push = PULL_SOURCE
             reasons.append(Reason(ref, check.detail, push))
             action = _max(action, push)
 
-    if report.scores.get("Accuracy") is None:
-        reasons.append(Reason("Score: Accuracy", "Accuracy was not scored; obtain evidence before execution.", PULL_SOURCE))
-        action = _max(action, PULL_SOURCE)
-
-    # 5. Module scores: low bars confirm what kind of fix is needed.
-    for m, v in ta_scores(report).items():
-        if v is None:
+    # 4. Findings.
+    for f in report.findings:
+        if f.severity not in ("CRITICAL", "WARNING"):
             continue
-        if v <= 2:
+        k = f.kind.lower()
+        if k == "factual":
+            push = ESCALATE if f.severity == "CRITICAL" else REWRITE
+        else:
+            push = REWRITE  # framing / sycophancy / tone are fixable in the text
+        ev = (" Evidence: " + ", ".join('"%s"' % e for e in f.evidence[:2])) if f.evidence and k != "factual" else ""
+        reasons.append(Reason("Finding: %s (%s)" % (f.title, f.severity), _short(f.text, 120) + ev, push))
+        action = _max(action, push)
+
+    # 5. Module scores (bars: full = good).
+    for m, v in report.scores.items():
+        if v is None:
+            push = ESCALATE if (m == "Accuracy" and blast >= 0.6) else action
+            reasons.append(Reason("Score: %s" % m, "Ezio could not score %s (%s): too few checkable claims to vouch for this answer" % (m, report.score_notes.get(m, "")), push))
+            action = _max(action, push)
+        elif v <= 2:
             push = REWRITE if m in ("Bias", "Tone", "Agreement") else ESCALATE
-            reasons.append(Reason("Score: %s %d/5" % (m, v), "low %s score" % m.lower(), push))
+            reasons.append(Reason("Score: %s %d/5" % (m, v), "low — full bar means %s" % report.score_notes.get(m, "good"), push))
             action = _max(action, push)
 
-    # 6. Trust coefficient vs. required trust for this blast radius.
+    # 6. Trust coefficient vs. the bar for this blast radius.
+    fixable = action == REWRITE and not contradicted and not unv_fact
     if ta.trust_low >= req and action in (APPROVE, REWRITE):
         reasons.append(Reason("Trust", "conservative evidence score %.2f clears the %.2f bar for '%s'" % (ta.trust_low, req, ctx.use), action))
+    elif fixable:
+        reasons.append(Reason("Trust", "trust %.2f–%.2f is under the %.2f bar, but every issue is fixable in the text → rewrite, then re-verify with Ezio" % (ta.trust_low, ta.trust_high, req), REWRITE))
     elif ta.trust_high < req:
-        # Missing evidence requests research; it is not a factual contradiction.
-        push = PULL_SOURCE if unverified else BLOCK if blast >= 0.6 else ESCALATE
+        push = BLOCK if (contradicted and blast >= 0.6) else ESCALATE
         reasons.append(Reason("Trust", "even optimistic evidence score %.2f is below the %.2f bar" % (ta.trust_high, req), push))
         action = _max(action, push)
+    elif action != APPROVE:
+        reasons.append(Reason("Trust", "heuristic score range %.2f–%.2f straddles the %.2f bar: the answer hinges on what Ezio couldn't verify" % (ta.trust_low, ta.trust_high, req), action))
     elif action == APPROVE:
-        # interval straddles the bar: the answer depends on the unknowns
         reasons.append(Reason("Trust", "heuristic score range %.2f–%.2f straddles the %.2f bar; outcome depends on unverified claims" % (ta.trust_low, ta.trust_high, req), ESCALATE))
         action = ESCALATE
 
@@ -167,8 +184,13 @@ def decide(report: TrustReport, context: str | Context, ta: Optional[TrustAssess
         reasons.append(Reason("Coverage", "only %.0f%% of fact-like sentences were checked" % (ta.coverage * 100), PULL_SOURCE))
         action = _max(action, PULL_SOURCE)
 
+    contradicted = contradicted  # for plan
+    unverified = unv_fact
+    partial = partial + unv_partial + unv_opinion + detail_wrong
     plan = _plan(action, contradicted, unverified, partial, weak_supported, ta, ctx)
     handoff = _handoff(action, ctx, contradicted, unverified, ta)
+    if handoff and report.scores.get("Accuracy") is None:
+        handoff = handoff.replace(" because ", " because Ezio could not score accuracy; ", 1)
     return Decision(
         action=action,
         tripped=action != APPROVE,
@@ -180,14 +202,15 @@ def decide(report: TrustReport, context: str | Context, ta: Optional[TrustAssess
         reasons=reasons,
         plan=plan,
         blind_spots=ta.blind_spots,
+        reliability=reliability,
         handoff=handoff,
         targets={
             "contradicted": [a.claim.id for a in contradicted],
+            "detail_wrong": [a.claim.id for a in detail_wrong],
             "unverified": [a.claim.id for a in unverified],
             "partial": [a.claim.id for a in partial],
             "weak_supported": [a.claim.id for a in weak_supported],
         },
-        reliability=reliability,
     )
 
 
@@ -208,11 +231,13 @@ def _plan(action, contradicted, unverified, partial, weak, ta, ctx) -> List[str]
         ids = [a.claim.id for a in unverified + weak]
         steps.append("Pull an independent Official/Academic source for claim(s): %s" % ", ".join("#%d" % i for i in ids))
     if partial:
-        steps.append("Hedge partially-supported claim(s): %s" % ", ".join("#%d" % a.claim.id for a in partial))
+        steps.append("Rewrite claim(s) %s: correct wrong details, keep only verified parts, attribute opinions" % ", ".join("#%d" % a.claim.id for a in partial))
     fix_kinds = sorted({f.kind for f in ta.critical_findings if f.kind.lower() != "factual"})
     if fix_kinds:
         steps.append("Rewrite to neutralise: %s" % ", ".join(fix_kinds))
-    if action in (ESCALATE, BLOCK):
+    if action == REWRITE:
+        steps.append("Re-run the rewrite through Ezio; release only if the new report clears the bar")
+    if action in (ESCALATE, BLOCK, REWRITE):
         steps.append("Hand off to %s for sign-off before anyone can '%s'" % (ctx.owner, ctx.use))
     if action == APPROVE:
         steps.append("Release to %s with the trust report attached" % ctx.owner)
@@ -230,7 +255,7 @@ def _handoff(action, ctx, contradicted, unverified, ta) -> Optional[str]:
     if ta.critical_findings:
         bits.append("%d CRITICAL finding(s)" % len(ta.critical_findings))
     why = "; ".join(bits) or "trust is below the bar for this use"
-    return "%s: the fuse tripped (%s) because %s. Submit a source for verification, request a rewrite, reject, or record an override request (execution remains held)?" % (
+    return "%s: the fuse tripped (%s) because %s. Submit a source for verification, request a rewrite, reject, or record an override request (execution stays held)?" % (
         ctx.owner,
         action,
         why,
