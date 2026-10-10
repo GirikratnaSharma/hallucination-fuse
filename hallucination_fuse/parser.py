@@ -1,9 +1,11 @@
 """Parse an exported Ezio trust report (PDF) into structured evidence.
 
-The Ezio PDF is text-based. We extract text with pypdf and then pull out:
-analyzed text, verdict, module score bars, claims (+ verdicts + sources), findings.
-The parser is deliberately tolerant: Ezio's layout may shift, so every section
-is optional and the raw text is always kept for the LLM layer.
+Built against real Ezio v1 exports. Layout:
+  Analyzed text · Verdict · Issues found: N · Module Scores (█░ bars, or "Not scored")
+  Claim analysis → Claim N / text / Verdict: X[: detail] / What|Amount checks → (Source k)
+                   / Sources: ● k Type · Title — Published: date
+  Findings → "<Module> (NOTE|WARNING|CRITICAL|N/A)" + body / Reasoning / Evidence
+  Methodology (ignored)
 """
 from __future__ import annotations
 
@@ -12,28 +14,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Optional, Dict
 
-FILLED = "█"
-EMPTY = "░"
-
 MODULES = ["Accuracy", "Bias", "Tone", "Agreement"]
-
-CLAIM_VERDICTS = [
-    "Supported",
-    "Partially supported",
-    "Mostly supported",
-    "Not enough evidence",
-    "Insufficient evidence",
-    "Unverified",
-    "Disputed",
-    "Contradicted",
-    "Refuted",
-    "Misleading",
-    "False",
-]
-
-SOURCE_TYPES = ["Official", "News", "Academic", "Other"]
-SEVERITIES = ["CRITICAL", "WARNING", "NOTE"]
-FINDING_KINDS = ["Sentiment", "Factual", "Framing", "Sycophancy", "Bias", "Tone"]
+SOURCE_TYPES = ["Official", "Academic", "Reference", "News", "Other"]
 
 
 @dataclass
@@ -41,21 +23,39 @@ class Source:
     type: str
     title: str
     date: Optional[str] = None
+    idx: Optional[int] = None
+
+
+@dataclass
+class Check:
+    """One sub-check Ezio ran on a claim, e.g. What / Amount."""
+
+    aspect: str  # What | Amount | Date | Who ...
+    status: str  # match | not_found | different | contradicts
+    detail: str
+    source_idx: Optional[int] = None
 
 
 @dataclass
 class Claim:
     id: int
     text: str
-    verdict: str
+    verdict: str  # Supported | Not enough evidence | Contradicted ...
+    verdict_detail: Optional[str] = None  # e.g. "detail" in "Contradicted: detail"
     sources: List[Source] = field(default_factory=list)
+    checks: List[Check] = field(default_factory=list)
+
+    def source(self, idx: Optional[int]) -> Optional[Source]:
+        return next((s for s in self.sources if s.idx == idx), None) if idx else None
 
 
 @dataclass
 class Finding:
-    kind: str
-    severity: str
+    kind: str  # Sentiment | Factual | Framing | Sycophancy
+    title: str
+    severity: str  # NOTE | WARNING | CRITICAL | N/A
     text: str
+    evidence: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -65,7 +65,8 @@ class TrustReport:
     analyzed_text: str
     verdict: str
     issue_count: Optional[int]
-    scores: Dict[str, Optional[int]]  # module -> filled blocks (0-5)
+    scores: Dict[str, Optional[int]]  # module -> filled blocks (0-5), None = not scored
+    score_notes: Dict[str, str]
     claims: List[Claim]
     findings: List[Finding]
     raw_text: str
@@ -76,44 +77,62 @@ class TrustReport:
         return d
 
 
+# ---------------------------------------------------------------- extraction
+
 def extract_text(pdf_path: str) -> str:
     from pypdf import PdfReader
 
     reader = PdfReader(pdf_path)
-    return "\n".join((p.extract_text() or "") for p in reader.pages)
+    try:
+        return "\n".join(p.extract_text(extraction_mode="layout") or "" for p in reader.pages)
+    except TypeError:  # older pypdf
+        return "\n".join(p.extract_text() or "" for p in reader.pages)
 
 
-def _bar_value(segment: str) -> Optional[int]:
-    """Count filled blocks in a █░ bar (Tips: scores are bars, not numbers)."""
-    m = re.search(r"[█░▓▒■□]{3,}", segment)
-    if not m:
-        n = re.search(r"\b([0-5])\s*/\s*5\b", segment)
-        return int(n.group(1)) if n else None
-    bar = m.group(0)
-    return sum(1 for c in bar if c in "█▓■")
+def _clean(s: str) -> str:
+    return " ".join(s.split())
 
 
-def _section(text: str, start_pat: str, end_pats: List[str]) -> str:
-    m = re.search(start_pat, text, re.I)
+def _between(text: str, start: str, ends: List[str]) -> str:
+    m = re.search(start, text, re.M)
     if not m:
         return ""
     rest = text[m.end():]
-    end = len(rest)
-    for p in end_pats:
-        e = re.search(p, rest, re.I)
-        if e and e.start() < end:
-            end = e.start()
-    return rest[:end].strip()
+    cut = len(rest)
+    for e in ends:
+        x = re.search(e, rest, re.M)
+        if x:
+            cut = min(cut, x.start())
+    return rest[:cut]
+
+
+def _bullets(block: str) -> List[str]:
+    """Split a block into ●-bullets, joining wrapped continuation lines."""
+    items, cur = [], None
+    for ln in block.split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("●"):
+            if cur is not None:
+                items.append(_clean(cur))
+            cur = s.lstrip("● ").strip()
+        elif cur is not None:
+            cur += " " + s
+    if cur is not None:
+        items.append(_clean(cur))
+    return items
 
 
 def _guess_topic(text: str) -> str:
     t = text.lower()
     for key, label in [
         ("nuclear", "Nuclear energy"),
-        ("work from home", "Work from home"),
         ("remote work", "Work from home"),
+        ("work from home", "Work from home"),
         ("electric vehicle", "EV market"),
         (" ev ", "EV market"),
+        (" evs", "EV market"),
         ("agi", "AGI timelines"),
         ("artificial general intelligence", "AGI timelines"),
     ]:
@@ -122,109 +141,95 @@ def _guess_topic(text: str) -> str:
     return "Unknown"
 
 
+# ---------------------------------------------------------------- sections
+
 def _parse_sources(block: str) -> List[Source]:
-    sources: List[Source] = []
+    out = []
     type_alt = "|".join(SOURCE_TYPES)
-    for m in re.finditer(
-        rf"\b({type_alt})\b[\s:·\-–|]*(.+?)(?=(?:\b(?:{type_alt})\b[\s:·\-–|])|$)",
-        block,
-        re.S,
-    ):
-        body = " ".join(m.group(2).split())
-        date_m = re.search(
-            r"(\d{4}-\d{2}-\d{2}|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.? \d{1,2},? \d{4}|\b\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4}|\b(?:19|20)\d{2}\b)",
-            body,
-        )
-        date = date_m.group(0) if date_m else None
-        title = body.replace(date, "").strip(" ·-–|,") if date else body
-        if title:
-            sources.append(Source(type=m.group(1), title=title[:200], date=date))
-    return sources
+    for b in _bullets(block):
+        m = re.match(rf"(\d+)\s+({type_alt})\s*·\s*(.+)$", b)
+        if not m:
+            continue
+        rest = m.group(3)
+        date = None
+        dm = re.search(r"—\s*Published:\s*(\d{4}-\d{2}-\d{2})", rest)
+        if dm:
+            date = dm.group(1)
+            rest = rest[: dm.start()]
+        out.append(Source(type=m.group(2), title=rest.strip(" —"), date=date, idx=int(m.group(1))))
+    return out
+
+
+def _parse_checks(block: str) -> List[Check]:
+    out = []
+    for b in _bullets(block):
+        m = re.match(r"(What|Amount|Date|Who|Where|When|Number|Quote)\s*:\s*(.+)$", b)
+        if not m:
+            continue
+        body = m.group(2)
+        src = re.search(r"\(Source (\d+)\)", body)
+        low = body.lower()
+        if "not found" in low:
+            status = "not_found"
+        elif "different detail" in low:
+            status = "different"
+        elif "sources say" in low or "contradict" in low:
+            status = "contradicts"
+        elif "matches" in low:
+            status = "match"
+        else:
+            status = "unknown"
+        out.append(Check(aspect=m.group(1), status=status, detail=body, source_idx=int(src.group(1)) if src else None))
+    return out
 
 
 def _parse_claims(section: str) -> List[Claim]:
-    if not section:
-        return []
-    verdict_alt = "|".join(re.escape(v) for v in sorted(CLAIM_VERDICTS, key=len, reverse=True))
-    parts = re.split(rf"({verdict_alt})", section, flags=re.I)
-    claims: List[Claim] = []
-    # parts: [pre, verdict1, post1, verdict2, post2, ...]
-    # Claim text usually precedes its verdict; sources follow it.
-    pending_text = parts[0]
-    for i in range(1, len(parts), 2):
-        verdict = parts[i]
-        after = parts[i + 1] if i + 1 < len(parts) else ""
-        # Split `after` into this claim's sources and the next claim's text.
-        # The next claim text starts after the last source line; heuristically
-        # the last sentence-like chunk without a source-type keyword.
-        lines = [l for l in after.split("\n") if l.strip()]
-        src_lines, next_text = [], []
-        seen_src = False
-        for ln in lines:
-            if re.match(r"\s*(Claim\s*\d+[:.)]?|\d+[.)])\s", ln):
-                next_text = [ln]
-                seen_src = False
-                continue
-            if next_text and re.match(r"\s*(Claim\s*\d+[:.)]?|\d+[.)])\s", next_text[0]):
-                next_text.append(ln)
-                continue
-            if re.search(r"\b(" + "|".join(SOURCE_TYPES) + r")\b", ln) or (
-                seen_src and re.search(r"\b(19|20)\d{2}\b", ln) and len(ln) < 80
-            ):
-                if next_text:  # a source after text → text belonged to source titles
-                    src_lines.extend(next_text)
-                    next_text = []
-                src_lines.append(ln)
-                seen_src = True
+    claims = []
+    chunks = re.split(r"^\s*Claim (\d+)\s*$", section, flags=re.M)
+    # chunks: [preamble, id1, body1, id2, body2, ...]
+    for i in range(1, len(chunks), 2):
+        cid, body = int(chunks[i]), chunks[i + 1]
+        vm = re.search(r"^\s*Verdict:\s*(.+)$", body, re.M)
+        text = _clean(body[: vm.start()]) if vm else ""
+        verdict, vdetail = "Unknown", None
+        if vm:
+            v = vm.group(1).strip()
+            if ":" in v:
+                verdict, vdetail = [x.strip() for x in v.split(":", 1)]
             else:
-                next_text.append(ln)
-        text = " ".join(pending_text.split())
-        text = re.sub(r"^(Claim\s*\d+[:.)]?\s*|\d+[.)]\s*|Sources?:?\s*)", "", text, flags=re.I)
-        text = re.sub(r"\bSources?\s*:?\s*$", "", text, flags=re.I).strip(" :-–")
+                verdict = v
+        src_block = _between(body, r"^\s*Sources:\s*$", [r"\Z"])
+        check_block = body[vm.end():] if vm else body
+        sm = re.search(r"^\s*Sources:\s*$", check_block, re.M)
+        if sm:
+            check_block = check_block[: sm.start()]
         claims.append(
             Claim(
-                id=len(claims) + 1,
-                text=text[-400:],
-                verdict=_normalize_verdict(verdict),
-                sources=_parse_sources("\n".join(src_lines)),
+                id=cid,
+                text=text,
+                verdict=verdict,
+                verdict_detail=vdetail,
+                sources=_parse_sources(src_block),
+                checks=_parse_checks(check_block),
             )
         )
-        pending_text = "\n".join(next_text)
     return claims
 
 
-def _normalize_verdict(v: str) -> str:
-    for cv in CLAIM_VERDICTS:
-        if cv.lower() == v.lower():
-            return cv
-    return v
+_KIND = [("sentiment", "Sentiment"), ("factual", "Factual"), ("framing", "Framing"), ("sycophan", "Sycophancy"), ("tone", "Tone"), ("bias", "Framing")]
 
 
 def _parse_findings(section: str) -> List[Finding]:
-    if not section:
-        return []
-    sev_re = re.compile(r"\b(" + "|".join(SEVERITIES) + r")\b")
-    findings: List[Finding] = []
-    cur = None  # [label, severity, body_lines]
-    for ln in [l.strip() for l in section.split("\n") if l.strip()]:
-        m = sev_re.search(ln)
-        if m:
-            label = ln[: m.start()].strip(" :-–·|")
-            if not label and cur and cur[2]:
-                label = cur[2].pop()  # label sat on its own line above
-            if cur:
-                findings.append(cur)
-            cur = [label, m.group(1), [ln[m.end():].strip(" :-–·|")]]
-        elif cur:
-            cur[2].append(ln)
-    if cur:
-        findings.append(cur)
     out = []
-    for label, sev, body in findings:
-        kind = next((k for k in FINDING_KINDS if k.lower() in label.lower()), None)
-        if kind is None:
-            kind = next((k for k in FINDING_KINDS if k.lower() in " ".join(body).lower()[:120]), label or "General")
-        out.append(Finding(kind=kind, severity=sev, text=" ".join(" ".join(body).split())[:600]))
+    heads = list(re.finditer(r"^\s*([A-Z][A-Za-z &/]+?)\s*\((NOTE|WARNING|CRITICAL|N/A)\)\s*$", section, re.M))
+    for j, h in enumerate(heads):
+        body = section[h.end(): heads[j + 1].start() if j + 1 < len(heads) else len(section)]
+        ev_m = re.search(r"^\s*Evidence:\s*$", body, re.M)
+        evidence = _bullets(body[ev_m.end():]) if ev_m else []
+        main = body[: ev_m.start()] if ev_m else body
+        title = h.group(1).strip()
+        kind = next((k for key, k in _KIND if key in title.lower()), title)
+        out.append(Finding(kind=kind, title=title, severity=h.group(2), text=_clean(main), evidence=[e.strip('"') for e in evidence]))
     return out
 
 
@@ -235,30 +240,39 @@ def parse_report(pdf_path: str) -> TrustReport:
 
 
 def parse_text(raw: str, path: str = "<text>") -> TrustReport:
-    analyzed = _section(
-        raw,
-        r"Analy[sz]ed\s+text",
-        [r"\bVerdict\b", r"Module\s+scores", r"\bAccuracy\b", r"Claim\s+analysis"],
-    )
-    verdict_sec = _section(raw, r"\bVerdict\b", [r"Module\s+scores", r"\bAccuracy\b", r"Claim\s+analysis"])
-    verdict_line = next((l.strip() for l in verdict_sec.split("\n") if l.strip()), "")
-    issues_m = re.search(r"(\d+)\s+(?:issues?|flags?|problems?)", verdict_sec or raw, re.I)
+    analyzed = _clean(_between(raw, r"^\s*Analyzed text\s*$", [r"^\s*Verdict\s*$"]))
+    verdict = _clean(_between(raw, r"^\s*Verdict\s*$", [r"^\s*Issues found", r"^\s*Module Scores"]))
+    im = re.search(r"Issues found:\s*(\d+)", raw)
 
     scores: Dict[str, Optional[int]] = {}
+    notes: Dict[str, str] = {}
     for mod in MODULES:
-        m = re.search(rf"\b{mod}\b(.{{0,40}})", raw, re.S)
-        scores[mod] = _bar_value(m.group(1)) if m else None
+        m = re.search(rf"^\s*{mod}:\s*(.+)$", raw, re.M)
+        if not m:
+            scores[mod] = None
+            notes[mod] = "missing"
+            continue
+        line = m.group(1)
+        bar = re.search(r"[█░]{5}", line)
+        if bar:
+            scores[mod] = bar.group(0).count("█")
+            fm = re.search(r"full\s*=\s*(.+)$", line)
+            notes[mod] = fm.group(1).strip() if fm else ""
+        else:
+            scores[mod] = None
+            notes[mod] = line.strip()  # e.g. "Not scored"
 
-    claims_sec = _section(raw, r"Claim\s+analysis", [r"\bFindings\b"])
-    findings_sec = _section(raw, r"\bFindings\b", [r"Generated by", r"ezioai\.io\s*$"])
+    claims_sec = _between(raw, r"^\s*Claim analysis\s*$", [r"^\s*Findings\s*$"])
+    findings_sec = _between(raw, r"^\s*Findings\s*$", [r"^\s*Methodology\s*$", r"Generated by ezio"])
 
     return TrustReport(
         path=path,
-        topic=_guess_topic(analyzed or raw),
+        topic=_guess_topic(analyzed),
         analyzed_text=analyzed,
-        verdict=verdict_line,
-        issue_count=int(issues_m.group(1)) if issues_m else None,
+        verdict=verdict,
+        issue_count=int(im.group(1)) if im else None,
         scores=scores,
+        score_notes=notes,
         claims=_parse_claims(claims_sec),
         findings=_parse_findings(findings_sec),
         raw_text=raw,
