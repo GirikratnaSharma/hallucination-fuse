@@ -1,0 +1,3 @@
+pypdf>=4.0
+rich>=13.0
+anthropic>=0.40  # optional: enables Claude-powered rewrites

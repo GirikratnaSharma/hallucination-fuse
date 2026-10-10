@@ -1,0 +1,30 @@
+SYNTHETIC TEST FIXTURE — NOT A REAL EZIO REPORT (mimics the documented layout)
+Analyzed text
+Remote work is clearly the future. Studies show 98% of employees are more productive at home. Most companies have permanently adopted hybrid work since 2023. Remote workers save an average of 72 minutes per day on commuting. Anyone who disagrees is simply out of touch with modern workplaces.
+Verdict
+Mostly reliable with framing concerns · 4 issues found
+Module scores
+Accuracy ███░░
+Bias ██░░░
+Tone ███░░
+Agreement ████░
+Claim analysis
+Claim 1: Studies show 98% of employees are more productive at home.
+Contradicted
+Sources
+News Stanford study finds mixed productivity effects of remote work 2024-03-12
+Official BLS American Time Use Survey 2023
+Claim 2: Most companies have permanently adopted hybrid work since 2023.
+Not enough evidence
+Sources
+Other Blog: The hybrid revolution 2022
+Claim 3: Remote workers save an average of 72 minutes per day on commuting.
+Supported
+Sources
+Official NBER working paper on commute time savings 2023-09-01
+News Reuters: Remote workers reclaim commute time 2023-10-02
+Findings
+Sentiment NOTE Strongly positive sentiment toward remote work throughout.
+Factual claims CRITICAL The 98% productivity figure is not supported by cited research.
+Framing bias CRITICAL Dismisses opposing views as "out of touch".
+Sycophancy NOTE Response mirrors the user's apparent preference.
