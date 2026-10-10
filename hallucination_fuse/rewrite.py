@@ -40,5 +40,9 @@ def rewrite(report: TrustReport, d: Decision) -> dict:
             continue
         if any(_overlap(s, c.text) > 0.5 for c in hedge):
             s = re.sub(r"[.!?]$", "", s) + " (this could not be independently verified)."
-        kept.append(s)
+        if style:
+            if re.search(r"anyone who disagrees|out of touch|only a fool|obviously wrong", s, re.I):
+                continue  # dismissive framing flagged by the report
+            s = re.sub(r"\b(clearly|obviously|undeniably|simply|certainly)\s+", "", s, flags=re.I)
+        kept.append(s[:1].upper() + s[1:])
     return {"engine": "rules", "text": " ".join(kept), "removed": [c.id for c in remove], "hedged": [c.id for c in hedge]}

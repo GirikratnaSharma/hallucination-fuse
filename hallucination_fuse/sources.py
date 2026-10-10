@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from typing import List, Optional
 
-STOP = set("the a an of and or to in on for with by is are was were be that this it as at from will has have more than".split())
+STOP = set("the a an of and or to in on for with by is are was were be that this it as at from will has have more than most since many some about into over also".split())
 
 
 def _query(claim: str) -> str:
@@ -32,8 +32,12 @@ def lookup(claim: str, timeout: float = 6.0) -> List[dict]:
     except Exception as e:  # network optional
         return [{"error": str(e)}]
     out = []
+    cw = set(w.lower() for w in re.findall(r"[A-Za-z]{4,}", claim)) - STOP
     for hit in data.get("query", {}).get("search", []):
         snippet = re.sub(r"<[^>]+>", "", hit.get("snippet", ""))
+        hw = set(w.lower() for w in re.findall(r"[A-Za-z]{4,}", hit["title"] + " " + snippet))
+        if len(cw & hw) < max(2, len(cw) // 2):
+            continue  # irrelevant hit: don't pretend it's evidence
         out.append(
             {
                 "type": "Other",
