@@ -163,6 +163,8 @@ def decide(report: TrustReport, context: str | Context, ta: Optional[TrustAssess
     partial = partial + unv_partial + unv_opinion + detail_wrong
     plan = _plan(action, contradicted, unverified, partial, weak_supported, ta, ctx)
     handoff = _handoff(action, ctx, contradicted, unverified, ta)
+    if handoff and report.scores.get("Accuracy") is None:
+        handoff = handoff.replace(" because ", " because Ezio could not score accuracy; ", 1)
     return Decision(
         action=action,
         tripped=action != APPROVE,
