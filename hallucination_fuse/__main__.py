@@ -56,6 +56,11 @@ def show_decision(d, title="Fuse decision"):
     head = "[bold %s]%s[/]  %s" % (c, d.action, "⚡ FUSE TRIPPED" if d.tripped else "✓ fuse holds")
     gauge = "trust [%.2f ─── %.2f]  vs required %.2f   (blast radius %.2f)" % (d.trust_low, d.trust_high, d.required, d.blast)
     lines = [head, gauge, "", "[bold]Why (every reason traces to the report):[/bold]"]
+    if d.reliability:
+        lines += ["", "[bold]Evidence metrics (heuristics, not probabilities):[/bold]"]
+        for key, metric in d.reliability["metrics"].items():
+            value = metric["value"]
+            lines.append("  %s: %s" % (key, "unknown" if value is None else "%.0f%%" % (100 * value)))
     for r in d.reasons:
         lines.append("  [%s]→ %-8s[/] [bold]%s[/]: %s" % (COLOR[r.pushes], r.pushes, r.ref, r.text))
     if d.blind_spots:
@@ -102,6 +107,7 @@ def main(argv=None):
         audit.record("rewrite", rw)
 
     if a.no_human:
+        audit.record("final", {"report": a.report, "context": a.context, "action": d.action})
         return
     script = list(a.human or [])
 
@@ -122,6 +128,7 @@ def main(argv=None):
     if final.action == REWRITE and d.action != REWRITE:
         rw = rewrite(report, final)
         con.print(Panel(rw["text"][:1500], title="Rewrite (%s)" % rw["engine"], border_style="yellow"))
+        audit.record("rewrite", rw)
     h = audit.record("final", {"report": a.report, "context": a.context, "action": final.action})
     ok, n, _ = audit.verify()
     con.print("[dim]Audit: %d entries, hash chain %s · head %s…[/dim]" % (n, "VALID" if ok else "BROKEN", h[:16]))

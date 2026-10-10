@@ -1,4 +1,4 @@
-"""Trust coefficient + blast radius.
+"""Heuristic evidence score range + blast radius.
 
 Trust is computed from the evidence in the report, not the top-line verdict:
 
@@ -11,9 +11,10 @@ Trust is computed from the evidence in the report, not the top-line verdict:
   * coverage    — how much of the analyzed text was actually checked.
 
 The output is an interval [trust_low, trust_high]:
-  trust_low  = every unverified claim turns out false
-  trust_high = every unverified claim turns out true
-The width of the interval is the epistemic uncertainty the report leaves open.
+  trust_low  = unverified claims receive conservative policy credit (0.15)
+  trust_high = unverified claims receive optimistic policy credit (0.85)
+This is a policy sensitivity range, not a statistical confidence interval.
+Its width does not measure all uncertainty (for example, source authenticity).
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from typing import Dict, List, Optional
 
 from .parser import Claim, TrustReport
 
-SOURCE_QUALITY = {"Official": 1.0, "Academic": 0.9, "News": 0.6, "Other": 0.3, "Human": 0.85}
+SOURCE_QUALITY = {"Official": 1.0, "Academic": 0.9, "Reference": 0.6, "News": 0.6, "Other": 0.3}
 
 SUPPORTED = {"Supported", "Mostly supported"}
 PARTIAL = {"Partially supported"}
@@ -37,6 +38,7 @@ HIGHER_IS_BETTER = {"Accuracy": True, "Bias": True, "Tone": True, "Agreement": T
 
 
 def verdict_class(v: str) -> str:
+    v = next((known for known in SUPPORTED | PARTIAL | CONTRADICTED if known.casefold() == v.strip().casefold()), v)
     if v in SUPPORTED:
         return "supported"
     if v in PARTIAL:
@@ -44,6 +46,21 @@ def verdict_class(v: str) -> str:
     if v in CONTRADICTED:
         return "contradicted"
     return "unverified"
+
+
+def claim_class(claim: Claim) -> str:
+    """Sub-checks may reduce support, but cannot silently upgrade a verdict."""
+    cls = verdict_class(claim.verdict)
+    statuses = {c.status for c in claim.checks}
+    if cls == "contradicted" or "contradicts" in statuses:
+        return "contradicted"
+    if any(c.source_idx is not None and claim.source(c.source_idx) is None for c in claim.checks):
+        return "unverified"
+    if statuses - {"match", "different"}:
+        return "unverified"
+    if "different" in statuses and cls == "supported":
+        return "partial"
+    return cls
 
 
 def _year(d: Optional[str]) -> Optional[int]:
@@ -54,12 +71,17 @@ def _year(d: Optional[str]) -> Optional[int]:
 
 
 def source_strength(claim: Claim, today: Optional[date] = None) -> float:
-    """0..1: how well the cited sources could back this claim (quality x recency x count)."""
+    """0..1: how well the cited sources could back this claim (source type x recency; source count earns no bonus)."""
     today = today or date.today()
     if not claim.sources:
         return 0.0
     vals = []
+    seen = set()
     for s in claim.sources:
+        key = " ".join(s.title.casefold().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
         q = SOURCE_QUALITY.get(s.type, 0.3)
         y = _year(s.date)
         if y is not None:
@@ -69,10 +91,8 @@ def source_strength(claim: Claim, today: Optional[date] = None) -> float:
             elif age > 2:
                 q *= 0.9
         vals.append(q)
-    vals.sort(reverse=True)
-    # best source counts fully, corroborating sources add diminishing value
-    s = vals[0] + sum(v * 0.25 / (i + 1) for i, v in enumerate(vals[1:]))
-    return min(1.0, s)
+    # Source independence is unknown, so count cannot increase the score.
+    return max(vals, default=0.0)
 
 
 @dataclass
@@ -122,7 +142,7 @@ def assess(report: TrustReport, today: Optional[date] = None) -> TrustAssessment
     # ---- claims ----
     cas: List[ClaimAssessment] = []
     for c in report.claims:
-        cls = verdict_class(c.verdict)
+        cls = claim_class(c)
         st = source_strength(c, today)
         load = bool(re.search(r"\d|%|percent|most|majority|will|always|never", c.text, re.I))
         if cls == "supported" and st < 0.5:
@@ -166,8 +186,8 @@ def assess(report: TrustReport, today: Optional[date] = None) -> TrustAssessment
 
     # ---- findings ----
     crit = [f for f in report.findings if f.severity == "CRITICAL"]
-    notes = [f for f in report.findings if f.severity != "CRITICAL"]
-    findings_score = max(0.0, 1.0 - 0.3 * len(crit) - 0.05 * len(notes))
+    notes = [f for f in report.findings if f.severity in ("NOTE", "WARNING")]
+    findings_score = max(0.0, 1.0 - 0.3 * len(crit) - sum(.15 if f.severity == "WARNING" else .05 for f in notes))
 
     # ---- coverage: which fact-like sentences in the answer were never checked ----
     sents = [s for s in _sentences(report.analyzed_text) if _FACTY.search(s)]
@@ -188,6 +208,8 @@ def assess(report: TrustReport, today: Optional[date] = None) -> TrustAssessment
     weak = [a for a in cas if a.cls == "supported" and a.strength < 0.5]
     if weak:
         blind.append("%d 'Supported' claim(s) rest only on low-quality (Other/News) or stale sources" % len(weak))
+    if any(c.pending_sources for c in report.claims):
+        blind.append("Human-submitted sources remain pending verification and do not raise trust")
     if any(v is None for v in report.scores.values()):
         blind.append("some module scores were missing from the report")
 

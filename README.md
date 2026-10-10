@@ -1,58 +1,90 @@
-# ⚡ Hallucination Fuse — a Trust Agent for Ezio reports
+# Hallucination Fuse
 
-A real-time **circuit breaker** for LLM output. It takes an [Ezio](https://ezioai.io) trust report as input, weighs the *evidence* (claims, source quality, module scores, findings, coverage) and decides the next action before anything high-stakes executes:
+A local trust-report prototype that checks evidence before a text-publishing
+function can run. Built for the Ezio Build a Trust Agent challenge.
 
-| Action | When |
-|---|---|
-| `APPROVE` | worst-case trust clears the bar for this use |
-| `REWRITE` | facts hold, but framing / tone / sycophancy / partial claims need fixing |
-| `PULL_SOURCE` | load-bearing claims are **unverified** (unknown ≠ false) → go get independent evidence |
-| `ESCALATE` | the trust interval straddles the bar → an accountable human decides |
-| `BLOCK` | **contradicted** load-bearing claims or critical factual findings at high blast radius |
+The local project incorporates upstream commit `795ca23`, including the real
+nuclear and work-from-home PDF reports, plus reliability metrics and guard fixes.
 
-Built for the Ezio *Build a Trust Agent* buildathon ([challenge](https://github.com/ezioai/Build-Trust-Agent)).
+## Run
 
-## How it decides
-
-1. **Parse** the PDF (pypdf) → analyzed text, verdict, module bars (filled `█` blocks counted), claims + verdicts + sources, findings.
-2. **Trust coefficient as an interval** `[trust_low, trust_high]`
-   - `trust_low` = every unverified claim turns out false, `trust_high` = every unverified claim turns out true.
-   - Width = the uncertainty the report leaves open. Contradicted claims score 0 in both, so they are never confused with "unverified".
-   - Claims weighted by **source quality** (Official 1.0 > Academic 0.9 > News 0.6 > Other 0.3, discounted when stale) and whether they're load-bearing (numbers, forecasts, absolutes).
-   - Plus module scores, CRITICAL/NOTE findings and **coverage** (fact-like sentences that Ezio never checked).
-3. **Blast radius** from *who relies on the answer and for what* (`--context`): reach × irreversibility × stakes, amplified by forecasts / money / safety language.
-   Required trust = `0.45 + 0.4 × blast`.
-4. **Fuse policy**: every reason points to a specific claim, score, finding or source. It also lists what the report could not check.
-5. **Human in the loop**: on ESCALATE / BLOCK / PULL_SOURCE it hands off to the accountable owner (Comms Lead, Senior Analyst, …). The owner can `approve <justification>`, `source <#> <type> <title>`, `falsify <#>`, `rewrite` or `reject <why>`, and **the agent re-scores and updates its decision**.
-6. **Immutable audit**: every decision, rewrite and human response goes to a SHA-256 hash-chained JSONL (`audit/fuse_audit.jsonl`), verified at the end of every run.
-
-## Quickstart
-
-```bash
-pip install -r requirements.txt
-python -m hallucination_fuse reports/wfh.pdf --context comms_publish       # interactive human hand-off
-python -m hallucination_fuse reports/ev.pdf  --context client_note \
-    --human "source 2 Official IEA Global EV Outlook 2025"                  # scripted human (for demos)
-python -m hallucination_fuse tests/fixtures/synthetic_wfh.txt              # synthetic fixture, no PDF needed
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m hallucination_fuse.demo
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-Contexts: `comms_publish`, `client_note`, `policy_brief`, `internal_memo`.
-Set `ANTHROPIC_API_KEY` to use Claude for rewrites; otherwise a rule-based rewriter is used.
+The offline demo runs both real PDFs through a guarded mock publication. It
+writes detailed JSON to `output/demo/` and audit records to `audit/`. No external
+publication occurs. Current public-comms decisions:
 
-## Two-line SDK
+- Nuclear: `BLOCK`, with an adverse claim verdict and contradictory sub-check.
+- Work from home: `PULL_SOURCE`, with unresolved claims and unscored Accuracy.
+
+Both decisions stop execution. Outcomes follow evidence and context, not filenames.
+
+## CLI and metrics
+
+```sh
+.venv/bin/python -m hallucination_fuse reports/nuclear.pdf --context comms_publish --no-network --human rewrite
+.venv/bin/python -m hallucination_fuse reports/wfh.pdf --context comms_publish --no-network --no-human
+.venv/bin/python -m hallucination_fuse.metrics reports/wfh.pdf
+```
+
+An optional Claude rewrite requires installing `anthropic` and configuring a
+supported model with `FUSE_MODEL` plus `ANTHROPIC_API_KEY`. Otherwise rewrites use
+local rules. Live LLM calls are not part of the offline validation.
+
+## Guard an action
 
 ```python
 from hallucination_fuse import Fuse
-decision = Fuse("client_note").check("reports/ev.pdf")   # .action .reasons .blind_spots .tripped
-```
 
-Or guard the risky action itself:
-
-```python
 @Fuse("comms_publish").guard(report="reports/wfh.pdf")
-def publish(): ...        # raises FuseTripped instead of running if trust is too low
+def publish(payload: str):
+    # Call a fixed destination here only after approval.
+    return publisher.send(payload)
 ```
+
+The decorated function must accept exactly one text argument, named `payload`
+(or set `payload_arg`). The guard checks a single snapshot of the report and
+requires the payload to match its analyzed text, ignoring whitespace differences.
+It raises `FuseTripped` for every held decision. Changed payloads require a new
+report. Other parameters and async callables are rejected rather than left
+unbound. The callable's destination and policy context are the integrator's
+responsibility; this prototype does not sandbox arbitrary functions.
+
+`Fuse("comms_publish").check(path)` provides a decision without executing anything.
+
+## Evidence and review
+
+- Empty, incomplete, or structurally invalid reports block execution.
+- Explicit `Not scored` is preserved as unavailable; unscored Accuracy requests evidence.
+- Sub-check contradictions, missing details, and unresolved source indices can
+  reduce support. A matching sub-check cannot upgrade an unverified claim.
+- Missing evidence requests research instead of being treated as a contradiction.
+- Source metadata is a proxy, not proof of source authenticity or relevance.
+- Submitted source titles are stored as pending evidence and cannot raise trust.
+- `rewrite` returns a proposed revision, keeps execution held, and requires a new report.
+- `approve <reason>` records an override request but cannot release execution;
+  authenticated, payload-bound reviewer authorization is not implemented.
+- `reject` blocks. `falsify` marks a claim contradicted and recomputes the decision.
+
+Trust ranges and reliability metrics are explainable heuristic scores, not model
+internal confidence or calibrated probabilities. See [METRICS.md](METRICS.md).
+
+## Audit guarantees
+
+Logs are hash-linked, with serialized writers and corruption checks before append.
+They record decisions, review responses, revisions, and guarded execution outcomes.
+They are **not immutable** and do not authenticate the reviewer or report issuer.
+Use `audit.verify(path, expected_head=checkpoint)` with an independently retained
+checkpoint to detect tail deletion or full replacement. Internal verification alone
+cannot establish historical completeness. File locking currently requires POSIX.
+A post-execution logging failure cannot undo an external side effect.
 
 ## Team
+
 - Girikratna Sharma
 - Merve Uçmaz

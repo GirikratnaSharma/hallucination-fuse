@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from .parser import TrustReport
+from .parser import TrustReport, validation_errors
 from .trust import (
     CONTEXTS,
     Context,
@@ -44,6 +44,8 @@ class Decision:
     blind_spots: List[str]
     handoff: Optional[str] = None  # question for the accountable human
     targets: dict = field(default_factory=dict)  # claim ids per bucket
+    reliability: dict = field(default_factory=dict)
+    report_sha256: Optional[str] = None
 
     def summary(self) -> str:
         return "%s | trust %.2f–%.2f vs required %.2f | blast %.2f" % (
@@ -64,8 +66,20 @@ def decide(report: TrustReport, context: str | Context, ta: Optional[TrustAssess
     ta = ta or assess(report)
     blast = blast_radius(ctx, report)
     req = required_trust(blast)
+    errors = validation_errors(report)
+    if errors:
+        return Decision(
+            action=BLOCK, tripped=True, trust_low=0.0, trust_high=1.0,
+            required=req, blast=blast, context=ctx,
+            reasons=[Reason("Input validation", error, BLOCK) for error in errors],
+            plan=["Supply a complete, parseable report before execution."],
+            blind_spots=errors, handoff="%s: replace or repair the report; reliability is unknown." % ctx.owner,
+            targets={"contradicted": [], "unverified": [], "partial": [], "weak_supported": []},
+        )
     reasons: List[Reason] = []
     action = APPROVE
+    from .metrics import evaluate
+    reliability = evaluate(report).to_dict()
 
     contradicted = [a for a in ta.claims if a.cls == "contradicted"]
     unverified = [a for a in ta.claims if a.cls == "unverified"]
@@ -103,13 +117,28 @@ def decide(report: TrustReport, context: str | Context, ta: Optional[TrustAssess
 
     # 4. Source quality: "Supported" on weak sources is not the same as supported.
     for a in weak_supported:
-        push = PULL_SOURCE if blast >= 0.6 else APPROVE
+        push = PULL_SOURCE if blast >= 0.6 or a.strength == 0 else APPROVE
         types = ", ".join(sorted({s.type for s in a.claim.sources})) or "no sources"
         reasons.append(Reason("Claim %d sources" % a.claim.id, "Supported, but only by %s (strength %.2f)" % (types, a.strength), push))
         action = _max(action, push)
 
     for a in strong_supported:
         reasons.append(Reason("Claim %d" % a.claim.id, "Supported — %s" % a.note, APPROVE))
+
+    for a in ta.claims:
+        for check in a.claim.checks:
+            ref = "Claim %d / %s / Source %s" % (a.claim.id, check.aspect, check.source_idx or "unlinked")
+            push = BLOCK if check.status == "contradicts" and blast >= .6 else (
+                REWRITE if check.status in ("different", "contradicts") else
+                APPROVE if check.status == "match" else PULL_SOURCE)
+            if check.source_idx is not None and a.claim.source(check.source_idx) is None:
+                push = PULL_SOURCE
+            reasons.append(Reason(ref, check.detail, push))
+            action = _max(action, push)
+
+    if report.scores.get("Accuracy") is None:
+        reasons.append(Reason("Score: Accuracy", "Accuracy was not scored; obtain evidence before execution.", PULL_SOURCE))
+        action = _max(action, PULL_SOURCE)
 
     # 5. Module scores: low bars confirm what kind of fix is needed.
     for m, v in ta_scores(report).items():
@@ -122,14 +151,15 @@ def decide(report: TrustReport, context: str | Context, ta: Optional[TrustAssess
 
     # 6. Trust coefficient vs. required trust for this blast radius.
     if ta.trust_low >= req and action in (APPROVE, REWRITE):
-        reasons.append(Reason("Trust", "worst-case trust %.2f clears the %.2f bar for '%s'" % (ta.trust_low, req, ctx.use), action))
+        reasons.append(Reason("Trust", "conservative evidence score %.2f clears the %.2f bar for '%s'" % (ta.trust_low, req, ctx.use), action))
     elif ta.trust_high < req:
-        push = BLOCK if blast >= 0.6 else ESCALATE
-        reasons.append(Reason("Trust", "even best-case trust %.2f is below the %.2f bar" % (ta.trust_high, req), push))
+        # Missing evidence requests research; it is not a factual contradiction.
+        push = PULL_SOURCE if unverified else BLOCK if blast >= 0.6 else ESCALATE
+        reasons.append(Reason("Trust", "even optimistic evidence score %.2f is below the %.2f bar" % (ta.trust_high, req), push))
         action = _max(action, push)
     elif action == APPROVE:
         # interval straddles the bar: the answer depends on the unknowns
-        reasons.append(Reason("Trust", "trust interval %.2f–%.2f straddles the %.2f bar; outcome depends on unverified claims" % (ta.trust_low, ta.trust_high, req), ESCALATE))
+        reasons.append(Reason("Trust", "heuristic score range %.2f–%.2f straddles the %.2f bar; outcome depends on unverified claims" % (ta.trust_low, ta.trust_high, req), ESCALATE))
         action = ESCALATE
 
     # 7. Coverage: what the report never looked at.
@@ -157,6 +187,7 @@ def decide(report: TrustReport, context: str | Context, ta: Optional[TrustAssess
             "partial": [a.claim.id for a in partial],
             "weak_supported": [a.claim.id for a in weak_supported],
         },
+        reliability=reliability,
     )
 
 
@@ -199,7 +230,7 @@ def _handoff(action, ctx, contradicted, unverified, ta) -> Optional[str]:
     if ta.critical_findings:
         bits.append("%d CRITICAL finding(s)" % len(ta.critical_findings))
     why = "; ".join(bits) or "trust is below the bar for this use"
-    return "%s: the fuse tripped (%s) because %s. Approve with justification, supply a source, request a rewrite, or reject?" % (
+    return "%s: the fuse tripped (%s) because %s. Submit a source for verification, request a rewrite, reject, or record an override request (execution remains held)?" % (
         ctx.owner,
         action,
         why,

@@ -44,6 +44,7 @@ class Claim:
     verdict_detail: Optional[str] = None  # e.g. "detail" in "Contradicted: detail"
     sources: List[Source] = field(default_factory=list)
     checks: List[Check] = field(default_factory=list)
+    pending_sources: List[Source] = field(default_factory=list)
 
     def source(self, idx: Optional[int]) -> Optional[Source]:
         return next((s for s in self.sources if s.idx == idx), None) if idx else None
@@ -240,6 +241,20 @@ def parse_report(pdf_path: str) -> TrustReport:
 
 
 def parse_text(raw: str, path: str = "<text>") -> TrustReport:
+    # Preserve the original documented fixture format, but never infer an empty
+    # or unfamiliar report to be valid merely because parsing did not throw.
+    if re.search(r"^\s*Claim\s+\d+[:.)]\s+", raw, re.M):
+        from . import legacy_parser
+        old = legacy_parser.parse_text(raw, path)
+        return TrustReport(
+            path=path, topic=old.topic, analyzed_text=old.analyzed_text,
+            verdict=old.verdict, issue_count=old.issue_count, scores=old.scores,
+            score_notes={k: "legacy" if v is not None else "missing" for k, v in old.scores.items()},
+            claims=[Claim(id=c.id, text=c.text, verdict=c.verdict,
+                          sources=[Source(**vars(s)) for s in c.sources]) for c in old.claims],
+            findings=[Finding(kind=f.kind, title=f.kind, severity=f.severity, text=f.text) for f in old.findings],
+            raw_text=raw,
+        )
     analyzed = _clean(_between(raw, r"^\s*Analyzed text\s*$", [r"^\s*Verdict\s*$"]))
     verdict = _clean(_between(raw, r"^\s*Verdict\s*$", [r"^\s*Issues found", r"^\s*Module Scores"]))
     im = re.search(r"Issues found:\s*(\d+)", raw)
@@ -277,3 +292,27 @@ def parse_text(raw: str, path: str = "<text>") -> TrustReport:
         findings=_parse_findings(findings_sec),
         raw_text=raw,
     )
+
+
+def validation_errors(report: TrustReport) -> List[str]:
+    """Structural validity, not a claim that the report is authentic or true."""
+    errors = []
+    if not report.analyzed_text.strip():
+        errors.append("Analyzed text is missing")
+    if not report.verdict.strip():
+        errors.append("Report verdict is missing")
+    if not report.claims or any(not c.text.strip() for c in report.claims):
+        errors.append("Checked claims are missing or empty")
+    if len({c.id for c in report.claims}) != len(report.claims):
+        errors.append("Duplicate claim IDs")
+    for name in MODULES:
+        value = report.scores.get(name)
+        if value is None and report.score_notes.get(name, "").strip().casefold() == "not scored":
+            continue  # an explicit unavailable measurement is not a parser failure
+        if type(value) is not int or not 0 <= value <= 5:
+            errors.append("Missing or invalid module score: " + name)
+    if not re.search(r"^\s*Findings\s*:?\s*$", report.raw_text, re.M):
+        errors.append("Findings section is missing")
+    elif not report.findings:
+        errors.append("No findings could be parsed")
+    return errors
